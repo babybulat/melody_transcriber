@@ -1,0 +1,873 @@
+import os
+import sys
+import threading
+import queue
+import traceback
+import tempfile
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import numpy as np
+import soundfile as sf
+import time
+
+# Попытка импорта sounddevice
+try:
+    import sounddevice as sd
+    SOUNDDEVICE_AVAILABLE = True
+except ImportError:
+    SOUNDDEVICE_AVAILABLE = False
+
+# Попытка импорта pretty_midi
+try:
+    import pretty_midi
+    PRETTY_MIDI_AVAILABLE = True
+except ImportError:
+    PRETTY_MIDI_AVAILABLE = False
+
+# Попытка импорта basic_pitch
+try:
+    from basic_pitch.inference import predict
+    from basic_pitch import ICASSP_2022_MODEL_PATH
+    BASIC_PITCH_AVAILABLE = True
+except ImportError as e:
+    BASIC_PITCH_AVAILABLE = False
+    BASIC_PITCH_ERROR = str(e)
+
+# Попытка импорта librosa
+try:
+    import librosa
+    LIBROSA_AVAILABLE = True
+except ImportError:
+    LIBROSA_AVAILABLE = False
+
+# Попытка импорта pydub
+try:
+    from pydub import AudioSegment
+    PYDUB_AVAILABLE = True
+except ImportError:
+    PYDUB_AVAILABLE = False
+
+
+class PianoRoll(tk.Canvas):
+    """Визуализация нот в виде Piano Roll (классическая тема)"""
+    
+    def __init__(self, parent, **kwargs):
+        # Классическая тема
+        kwargs['bg'] = '#2b2b2b'
+        kwargs['highlightthickness'] = 0
+        super().__init__(parent, **kwargs)
+        
+        self.notes = []
+        self.note_rects = []
+        self.min_pitch = 40  # E2
+        self.max_pitch = 90  # F#6
+        self.pixels_per_second = 100
+        self.pixels_per_note = 14
+        self.total_duration = 0
+        self.scroll_x = 0
+        self.scroll_y = 0
+        self.grid_lines = []
+        
+        self.bind('<MouseWheel>', self.on_mousewheel)
+        self.bind('<Button-4>', self.on_mousewheel)
+        self.bind('<Button-5>', self.on_mousewheel)
+        
+        self.draw_piano_keys()
+        self.draw_grid()
+        
+        # Привязываем обновление сетки к прокрутке
+        self.bind('<Configure>', lambda e: self.after(100, self.redraw_grid))
+    
+    def draw_piano_keys(self):
+        """Рисует клавиши пианино слева (классические цвета)"""
+        self.delete('piano_key')
+        self.delete('piano_text')
+        
+        key_width = 45
+        
+        for pitch in range(self.min_pitch, self.max_pitch + 1):
+            y = (self.max_pitch - pitch) * self.pixels_per_note + 30
+            is_black = pitch % 12 in [1, 3, 6, 8, 10]
+            
+            if is_black:
+                # Чёрные клавиши
+                self.create_rectangle(0, y, key_width, y + self.pixels_per_note, 
+                                     fill='#1a1a1a', outline='#333333', width=1, tags='piano_key')
+                self.create_text(key_width - 30, y + self.pixels_per_note // 2, 
+                                text=self.get_note_name(pitch), fill='#cccccc', 
+                                font=('Arial', 8, 'bold'), tags='piano_text')
+            else:
+                # Белые клавиши
+                self.create_rectangle(0, y, key_width, y + self.pixels_per_note, 
+                                     fill='#f5f5f5', outline='#999999', width=1, tags='piano_key')
+                self.create_text(key_width - 30, y + self.pixels_per_note // 2, 
+                                text=self.get_note_name(pitch), fill='#333333', 
+                                font=('Arial', 8), tags='piano_text')
+        
+        # Разделительная линия
+        self.create_line(key_width, 0, key_width, 2000, fill='#666666', width=2, tags='piano_key')
+    
+    def get_note_name(self, pitch):
+        """Возвращает название ноты"""
+        names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+        octave = (pitch // 12) - 1
+        return f"{names[pitch % 12]}{octave}"
+    
+    def draw_grid(self):
+        """Рисует сетку на всё видимое пространство"""
+        self.delete('grid')
+        
+        visible_width = max(2000, int(self.total_duration * self.pixels_per_second) + 200)
+        visible_height = (self.max_pitch - self.min_pitch + 2) * self.pixels_per_note + 60
+        
+        # Вертикальные линии (время)
+        for t in range(0, visible_width, 50):
+            x = 45 + t
+            self.create_line(x, 0, x, visible_height, fill='#404040', width=1, tags='grid')
+        
+        # Вертикальные линии для секунд (жирнее)
+        for t in range(0, visible_width, 100):
+            x = 45 + t
+            self.create_line(x, 0, x, visible_height, fill='#555555', width=2, tags='grid')
+        
+        # Горизонтальные линии (ноты)
+        for pitch in range(self.min_pitch, self.max_pitch + 1):
+            y = (self.max_pitch - pitch) * self.pixels_per_note + 30
+            if pitch % 12 == 0:  # C - жирная линия
+                self.create_line(45, y, visible_width, y, fill='#666666', width=2, tags='grid')
+            else:
+                self.create_line(45, y, visible_width, y, fill='#404040', width=1, tags='grid')
+        
+        # Верхняя и нижняя границы
+        y_top = 30
+        y_bottom = (self.max_pitch - self.min_pitch + 1) * self.pixels_per_note + 30
+        self.create_line(45, y_top, visible_width, y_top, fill='#666666', width=2, tags='grid')
+        self.create_line(45, y_bottom, visible_width, y_bottom, fill='#666666', width=2, tags='grid')
+    
+    def redraw_grid(self, *args):
+        """Перерисовывает сетку при изменении размера"""
+        self.draw_grid()
+    
+    def set_midi_data(self, midi_data):
+        """Загружает MIDI данные и отображает ноты"""
+        self.clear_notes()
+        
+        max_time = 0
+        
+        for instrument in midi_data.instruments:
+            if instrument.is_drum:
+                continue
+            
+            for note in instrument.notes:
+                if self.min_pitch <= note.pitch <= self.max_pitch:
+                    self.notes.append(note)
+                    max_time = max(max_time, note.end)
+                    
+                    # Координаты
+                    x = 45 + note.start * self.pixels_per_second
+                    y = (self.max_pitch - note.pitch) * self.pixels_per_note + 30
+                    width = max(2, (note.end - note.start) * self.pixels_per_second)
+                    height = self.pixels_per_note - 1
+                    
+                    # Цвет ноты зависит от высоты (градиент от синего к красному)
+                    pitch_norm = (note.pitch - self.min_pitch) / (self.max_pitch - self.min_pitch)
+                    r = int(41 + 214 * pitch_norm)
+                    g = int(128 - 128 * pitch_norm)
+                    b = int(185 - 185 * pitch_norm)
+                    color = f'#{r:02x}{g:02x}{b:02x}'
+                    
+                    # Рисуем ноту
+                    rect = self.create_rectangle(
+                        x, y, x + width, y + height,
+                        fill=color, outline='', width=0,
+                        tags=('note', f'note_{len(self.note_rects)}')
+                    )
+                    
+                    # Тёмная обводка
+                    self.create_rectangle(
+                        x, y, x + width, y + height,
+                        fill='', outline='#1a1a1a', width=1,
+                        tags=('note_border',)
+                    )
+                    
+                    self.note_rects.append(rect)
+        
+        self.total_duration = max_time
+        
+        # Обновляем scrollregion
+        total_width = 45 + self.total_duration * self.pixels_per_second + 200
+        total_height = (self.max_pitch - self.min_pitch + 2) * self.pixels_per_note + 60
+        self.config(scrollregion=(0, 0, total_width, total_height))
+        
+        # Перерисовываем сетку с новым размером
+        self.draw_grid()
+        
+        # Статистика
+        note_count = len(self.notes)
+        if note_count > 0:
+            min_p = min(n.pitch for n in self.notes)
+            max_p = max(n.pitch for n in self.notes)
+            self.create_text(45, 15, 
+                           text=f"🎵 Нот: {note_count}  |  {self.get_note_name(min_p)} - {self.get_note_name(max_p)}  |  {self.total_duration:.1f}с",
+                           fill='#333333', font=('Arial', 9, 'bold'), anchor='w', tags='stats')
+    
+    def clear_notes(self):
+        """Очищает все ноты"""
+        self.delete('note')
+        self.delete('note_border')
+        self.delete('stats')
+        self.notes = []
+        self.note_rects = []
+    
+    def on_mousewheel(self, event):
+        """Прокрутка и масштабирование"""
+        if event.state & 0x0004:  # Ctrl + колесо = масштаб
+            old_scale = self.pixels_per_second
+            if event.delta > 0 or event.num == 4:
+                self.pixels_per_second = min(500, self.pixels_per_second * 1.2)
+            else:
+                self.pixels_per_second = max(20, self.pixels_per_second / 1.2)
+            
+            if old_scale != self.pixels_per_second:
+                self.redraw_notes()
+        else:  # Обычная прокрутка
+            if event.delta > 0 or event.num == 4:
+                self.yview_scroll(-1, 'units')
+            else:
+                self.yview_scroll(1, 'units')
+    
+    def redraw_notes(self):
+        """Перерисовывает ноты после масштабирования"""
+        if not self.notes:
+            return
+        
+        self.clear_notes()
+        
+        for note in self.notes:
+            if self.min_pitch <= note.pitch <= self.max_pitch:
+                x = 45 + note.start * self.pixels_per_second
+                y = (self.max_pitch - note.pitch) * self.pixels_per_note + 30
+                width = max(2, (note.end - note.start) * self.pixels_per_second)
+                height = self.pixels_per_note - 1
+                
+                pitch_norm = (note.pitch - self.min_pitch) / (self.max_pitch - self.min_pitch)
+                r = int(41 + 214 * pitch_norm)
+                g = int(128 - 128 * pitch_norm)
+                b = int(185 - 185 * pitch_norm)
+                color = f'#{r:02x}{g:02x}{b:02x}'
+                
+                rect = self.create_rectangle(
+                    x, y, x + width, y + height,
+                    fill=color, outline='', width=0,
+                    tags=('note',)
+                )
+                self.create_rectangle(
+                    x, y, x + width, y + height,
+                    fill='', outline='#1a1a1a', width=1,
+                    tags=('note_border',)
+                )
+                self.note_rects.append(rect)
+        
+        total_width = 45 + self.total_duration * self.pixels_per_second + 200
+        total_height = (self.max_pitch - self.min_pitch + 2) * self.pixels_per_note + 60
+        self.config(scrollregion=(0, 0, total_width, total_height))
+        
+        # Перерисовываем сетку
+        self.draw_grid()
+
+
+class AudioPlayer:
+    """Встроенный аудиоплеер"""
+    
+    def __init__(self, parent, status_callback=None):
+        self.parent = parent
+        self.status_callback = status_callback
+        self.audio_data = None
+        self.sample_rate = None
+        self.is_playing = False
+        self.is_paused = False
+        self.current_position = 0
+        self.total_duration = 0
+        self.update_job = None
+        self.start_time = 0
+        
+        self.create_controls()
+    
+    def create_controls(self):
+        self.frame = ttk.LabelFrame(self.parent, text="🎵 Плеер", padding=5)
+        
+        time_frame = ttk.Frame(self.frame)
+        time_frame.pack(fill="x", pady=5)
+        
+        self.current_time_label = ttk.Label(time_frame, text="00:00")
+        self.current_time_label.pack(side="left")
+        
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress_scale = ttk.Scale(
+            time_frame, from_=0, to=100, variable=self.progress_var,
+            orient="horizontal", command=self.on_seek
+        )
+        self.progress_scale.pack(side="left", fill="x", expand=True, padx=10)
+        
+        self.total_time_label = ttk.Label(time_frame, text="00:00")
+        self.total_time_label.pack(side="right")
+        
+        button_frame = ttk.Frame(self.frame)
+        button_frame.pack(pady=5)
+        
+        self.play_button = ttk.Button(button_frame, text="▶️", width=5, command=self.play, state="disabled")
+        self.play_button.pack(side="left", padx=2)
+        
+        self.pause_button = ttk.Button(button_frame, text="⏸️", width=5, command=self.pause, state="disabled")
+        self.pause_button.pack(side="left", padx=2)
+        
+        self.stop_button = ttk.Button(button_frame, text="⏹️", width=5, command=self.stop, state="disabled")
+        self.stop_button.pack(side="left", padx=2)
+        
+        self.status_label = ttk.Label(self.frame, text="Файл не загружен", foreground="gray")
+        self.status_label.pack(pady=5)
+    
+    def load_file(self, file_path):
+        try:
+            self.stop()
+            self.audio_data, self.sample_rate = sf.read(file_path)
+            
+            if len(self.audio_data.shape) > 1:
+                self.audio_data = np.mean(self.audio_data, axis=1)
+            
+            self.total_duration = len(self.audio_data) / self.sample_rate
+            self.total_time_label.config(text=self.format_time(self.total_duration))
+            self.current_time_label.config(text="00:00")
+            self.progress_var.set(0)
+            self.current_position = 0
+            
+            self.play_button.config(state="normal")
+            self.pause_button.config(state="disabled")
+            self.stop_button.config(state="disabled")
+            self.status_label.config(text=f"✅ Готово: {self.format_time(self.total_duration)}", foreground="green")
+            return True
+        except Exception as e:
+            self.status_label.config(text=f"❌ Ошибка: {str(e)[:50]}", foreground="red")
+            return False
+    
+    def play(self):
+        if self.audio_data is None or not SOUNDDEVICE_AVAILABLE:
+            return
+        
+        if self.is_paused:
+            self.is_paused = False
+            play_data = self.audio_data[self.current_position:]
+            sd.play(play_data, self.sample_rate)
+            self.start_time = time.time() - (self.current_position / self.sample_rate)
+        else:
+            seek_seconds = (self.progress_var.get() / 100) * self.total_duration
+            self.current_position = int(seek_seconds * self.sample_rate)
+            play_data = self.audio_data[self.current_position:]
+            sd.play(play_data, self.sample_rate)
+            self.start_time = time.time() - seek_seconds
+        
+        self.is_playing = True
+        self.play_button.config(state="disabled")
+        self.pause_button.config(state="normal")
+        self.stop_button.config(state="normal")
+        self.status_label.config(text="▶️ Воспроизведение...", foreground="#0066cc")
+        
+        if self.status_callback:
+            self.status_callback("Воспроизведение...")
+        
+        self._update_timer()
+    
+    def pause(self):
+        if self.is_playing:
+            if SOUNDDEVICE_AVAILABLE:
+                sd.stop()
+            elapsed = time.time() - self.start_time
+            self.current_position = int(elapsed * self.sample_rate)
+            self.is_playing = False
+            self.is_paused = True
+            self.play_button.config(state="normal")
+            self.pause_button.config(state="disabled")
+            self.status_label.config(text="⏸️ Пауза", foreground="orange")
+            if self.status_callback:
+                self.status_callback("Пауза")
+    
+    def stop(self):
+        if SOUNDDEVICE_AVAILABLE:
+            sd.stop()
+        self.is_playing = False
+        self.is_paused = False
+        self.current_position = 0
+        self.progress_var.set(0)
+        self.current_time_label.config(text="00:00")
+        self.play_button.config(state="normal")
+        self.pause_button.config(state="disabled")
+        self.stop_button.config(state="disabled")
+        self.status_label.config(text="⏹️ Остановлено", foreground="gray")
+        if self.status_callback:
+            self.status_callback("Готово")
+    
+    def on_seek(self, value):
+        if not self.is_playing:
+            pos_seconds = (float(value) / 100) * self.total_duration
+            self.current_position = int(pos_seconds * self.sample_rate)
+            self.current_time_label.config(text=self.format_time(pos_seconds))
+    
+    def _update_timer(self):
+        if self.is_playing and SOUNDDEVICE_AVAILABLE:
+            try:
+                elapsed = time.time() - self.start_time
+                if elapsed >= self.total_duration:
+                    self.stop()
+                else:
+                    self.current_time_label.config(text=self.format_time(elapsed))
+                    progress = (elapsed / self.total_duration) * 100
+                    self.progress_var.set(progress)
+                    self.update_job = self.parent.after(100, self._update_timer)
+            except:
+                self.stop()
+    
+    def format_time(self, seconds):
+        if seconds < 0:
+            seconds = 0
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes:02d}:{secs:02d}"
+    
+    def pack(self, **kwargs):
+        self.frame.pack(**kwargs)
+
+
+class SimplePianoTranscriber:
+    """Транскрибер мелодий с Piano Roll визуализацией"""
+    
+    def __init__(self, root):
+        self.root = root
+        self.root.title("🎹 AI Piano Transcriber")
+        self.root.geometry("1000x850")
+        self.root.resizable(True, True)
+        
+        self.input_file_path = tk.StringVar()
+        self.onset_threshold = tk.DoubleVar(value=0.5)
+        self.frame_threshold = tk.DoubleVar(value=0.3)
+        self.min_note_length = tk.IntVar(value=58)
+        self.processing = False
+        self.midi_data = None
+        self.result_audio_data = None
+        self.result_sample_rate = None
+        self.temp_dir = tempfile.mkdtemp()
+        
+        self.log_queue = queue.Queue()
+        
+        self.create_widgets()
+        self.check_dependencies()
+        
+        sys.stderr = self
+    
+    def write(self, text):
+        if text.strip() and "ALSA" not in text and "UserWarning" not in text and "PySoundFile" not in text:
+            self.log(f"⚠️ {text.strip()}")
+    
+    def flush(self):
+        pass
+    
+    def check_dependencies(self):
+        self.log("🔍 Проверка зависимостей...")
+        
+        if not BASIC_PITCH_AVAILABLE:
+            self.log(f"❌ Basic Pitch не установлен")
+        else:
+            self.log("✅ Basic Pitch готов")
+        
+        if not PRETTY_MIDI_AVAILABLE:
+            self.log("❌ Pretty MIDI не установлен")
+        else:
+            self.log("✅ Pretty MIDI готов")
+        
+        if not SOUNDDEVICE_AVAILABLE:
+            self.log("⚠️ SoundDevice не установлен")
+        else:
+            self.log("✅ SoundDevice готов")
+        
+        if LIBROSA_AVAILABLE:
+            self.log("✅ librosa готов")
+            self.mp3_converter = "librosa"
+        elif PYDUB_AVAILABLE:
+            self.log("⚠️ PyDub готов")
+            self.mp3_converter = "pydub"
+        else:
+            self.log("❌ MP3 не поддерживаются")
+            self.mp3_converter = None
+        
+        self.log("✅ Проверка завершена\n")
+    
+    def convert_mp3_to_wav(self, mp3_path):
+        wav_path = os.path.join(self.temp_dir, "temp.wav")
+        
+        if self.mp3_converter == "librosa" and LIBROSA_AVAILABLE:
+            self.log("   🔄 Конвертация через librosa...")
+            try:
+                audio, sr = librosa.load(mp3_path, sr=44100, mono=True)
+                sf.write(wav_path, audio, sr)
+                self.log("   ✅ Готово")
+                return wav_path
+            except Exception as e:
+                self.log(f"   ❌ Ошибка: {e}")
+                raise
+        
+        elif self.mp3_converter == "pydub" and PYDUB_AVAILABLE:
+            self.log("   🔄 Конвертация через PyDub...")
+            try:
+                audio = AudioSegment.from_mp3(mp3_path)
+                audio = audio.set_frame_rate(44100).set_channels(1)
+                audio.export(wav_path, format="wav")
+                self.log("   ✅ Готово")
+                return wav_path
+            except Exception as e:
+                self.log(f"   ❌ Ошибка: {e}")
+                raise
+        
+        else:
+            raise ImportError("Нет конвертера MP3")
+    
+    def create_widgets(self):
+        # Главный контейнер
+        main_container = ttk.Frame(self.root)
+        main_container.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        # Левая панель (управление)
+        left_panel = ttk.Frame(main_container, width=350)
+        left_panel.pack(side="left", fill="y", padx=(0, 10))
+        left_panel.pack_propagate(False)
+        
+        # Выбор файла
+        file_frame = ttk.LabelFrame(left_panel, text="📁 Выбор файла", padding=10)
+        file_frame.pack(fill="x", pady=5)
+        
+        ttk.Entry(file_frame, textvariable=self.input_file_path).pack(fill="x", pady=5)
+        ttk.Button(file_frame, text="Обзор...", command=self.browse_file).pack(fill="x")
+        
+        # Настройки
+        settings_frame = ttk.LabelFrame(left_panel, text="⚙️ Настройки точности", padding=10)
+        settings_frame.pack(fill="x", pady=5)
+        
+        ttk.Label(settings_frame, text="Чувствительность начала:").pack(anchor="w", pady=(0, 2))
+        onset_scale = ttk.Scale(settings_frame, from_=0.1, to=0.9, variable=self.onset_threshold)
+        onset_scale.pack(fill="x")
+        self.onset_label = ttk.Label(settings_frame, text="0.50")
+        self.onset_label.pack(anchor="e")
+        onset_scale.configure(command=lambda v: self.onset_label.configure(text=f"{float(v):.2f}"))
+        
+        ttk.Label(settings_frame, text="Чувствительность продолжения:").pack(anchor="w", pady=(10, 2))
+        frame_scale = ttk.Scale(settings_frame, from_=0.1, to=0.9, variable=self.frame_threshold)
+        frame_scale.pack(fill="x")
+        self.frame_label = ttk.Label(settings_frame, text="0.30")
+        self.frame_label.pack(anchor="e")
+        frame_scale.configure(command=lambda v: self.frame_label.configure(text=f"{float(v):.2f}"))
+        
+        ttk.Label(settings_frame, text="Мин. длина ноты (мс):").pack(anchor="w", pady=(10, 2))
+        length_spin = ttk.Spinbox(settings_frame, from_=30, to=200, textvariable=self.min_note_length, width=10)
+        length_spin.pack(fill="x")
+        
+        # Кнопки управления
+        control_frame = ttk.LabelFrame(left_panel, text="🎮 Управление", padding=10)
+        control_frame.pack(fill="x", pady=5)
+        
+        self.start_button = ttk.Button(control_frame, text="▶️ Анализировать", command=self.start_processing)
+        self.start_button.pack(fill="x", pady=2)
+        
+        self.save_button = ttk.Button(control_frame, text="💾 Сохранить WAV", command=self.save_result, state="disabled")
+        self.save_button.pack(fill="x", pady=2)
+        
+        self.export_midi_button = ttk.Button(control_frame, text="🎼 Экспорт MIDI", command=self.export_midi, state="disabled")
+        self.export_midi_button.pack(fill="x", pady=2)
+        
+        # Прогресс
+        self.progress = ttk.Progressbar(left_panel, mode="indeterminate")
+        self.progress.pack(fill="x", pady=5)
+        
+        # Плеер
+        self.player = AudioPlayer(left_panel, status_callback=self.update_status)
+        self.player.pack(fill="x", pady=5)
+        
+        # Правая панель (Piano Roll и лог)
+        right_panel = ttk.Frame(main_container)
+        right_panel.pack(side="right", fill="both", expand=True)
+        
+        # Piano Roll
+        piano_frame = ttk.LabelFrame(right_panel, text="🎹 Piano Roll", padding=5)
+        piano_frame.pack(fill="both", expand=True, pady=(0, 5))
+        
+        canvas_frame = ttk.Frame(piano_frame)
+        canvas_frame.pack(fill="both", expand=True)
+        
+        self.piano_roll = PianoRoll(canvas_frame, height=300)
+        self.piano_roll.pack(side="left", fill="both", expand=True)
+        
+        scrollbar_y = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.piano_roll.yview)
+        scrollbar_y.pack(side="right", fill="y")
+        
+        scrollbar_x = ttk.Scrollbar(piano_frame, orient="horizontal", command=self.piano_roll.xview)
+        scrollbar_x.pack(side="bottom", fill="x")
+        
+        self.piano_roll.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
+        
+        # Лог
+        log_frame = ttk.LabelFrame(right_panel, text="📋 Лог", padding=5)
+        log_frame.pack(fill="both", expand=True)
+        
+        self.log_text = tk.Text(
+            log_frame, height=6, wrap="word",
+            bg='#f5f5f5', fg='#333333', insertbackground='#333333',
+            relief='flat', borderwidth=1, font=('Consolas', 9)
+        )
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        self.log_text.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Кнопка очистки
+        ttk.Button(right_panel, text="🗑️ Очистить лог", command=self.clear_log).pack(pady=5)
+        
+        # Статус бар
+        self.status_var = tk.StringVar(value="Готов к работе")
+        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief="sunken", anchor="w")
+        status_bar.pack(fill="x", padx=10, pady=5)
+        
+        # Горячие клавиши
+        self.root.bind('<Control-o>', lambda e: self.browse_file())
+        self.root.bind('<Control-s>', lambda e: self.save_result() if self.save_button['state'] == 'normal' else None)
+        self.root.bind('<Control-m>', lambda e: self.export_midi() if self.export_midi_button['state'] == 'normal' else None)
+        self.root.bind('<space>', lambda e: self.player.play() if not self.player.is_playing else self.player.pause())
+    
+    def update_status(self, text):
+        self.status_var.set(text)
+    
+    def browse_file(self):
+        filetypes = [("Все поддерживаемые", "*.wav *.mp3"), ("WAV", "*.wav"), ("MP3", "*.mp3")]
+        filename = filedialog.askopenfilename(title="Выберите аудиофайл", filetypes=filetypes)
+        if filename:
+            self.input_file_path.set(filename)
+            self.log(f"📁 {os.path.basename(filename)}")
+    
+    def log(self, message):
+        self.log_queue.put(message)
+    
+    def clear_log(self):
+        self.log_text.config(state="normal")
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.config(state="disabled")
+    
+    def process_log_queue(self):
+        try:
+            while True:
+                msg = self.log_queue.get_nowait()
+                self.log_text.config(state="normal")
+                self.log_text.insert("end", msg + "\n")
+                self.log_text.see("end")
+                self.log_text.config(state="disabled")
+        except queue.Empty:
+            pass
+        self.root.after(100, self.process_log_queue)
+    
+    def start_processing(self):
+        if self.processing:
+            return
+        
+        if not BASIC_PITCH_AVAILABLE:
+            messagebox.showerror("Ошибка", "Basic Pitch не установлен!")
+            return
+        
+        input_path = self.input_file_path.get().strip()
+        if not input_path or not os.path.exists(input_path):
+            messagebox.showerror("Ошибка", "Выберите существующий файл")
+            return
+        
+        self.processing = True
+        self.start_button.config(state="disabled")
+        self.save_button.config(state="disabled")
+        self.export_midi_button.config(state="disabled")
+        self.progress.start(10)
+        self.status_var.set("Обработка...")
+        self.log("=" * 50)
+        self.log(f"🚀 Обработка: {os.path.basename(input_path)}")
+        
+        thread = threading.Thread(target=self.process_file, args=(input_path,), daemon=True)
+        thread.start()
+    
+    def process_file(self, input_path):
+        try:
+            ext = os.path.splitext(input_path)[1].lower()
+            
+            if ext == '.mp3':
+                if self.mp3_converter is None:
+                    raise ImportError("Установите librosa: pip install librosa")
+                wav_path = self.convert_mp3_to_wav(input_path)
+            else:
+                wav_path = input_path
+                self.log("   Формат WAV")
+            
+            self.log("🎵 Basic Pitch анализ...")
+            
+            model_output, midi_data, note_events = predict(
+                wav_path,
+                ICASSP_2022_MODEL_PATH,
+                onset_threshold=self.onset_threshold.get(),
+                frame_threshold=self.frame_threshold.get(),
+                minimum_note_length=self.min_note_length.get(),
+                minimum_frequency=80,
+                maximum_frequency=2000
+            )
+            
+            self.midi_data = midi_data
+            note_count = sum(len(instr.notes) for instr in midi_data.instruments)
+            self.log(f"✅ Распознано нот: {note_count}")
+            
+            if note_count == 0:
+                self.log("⚠️ Ноты не найдены!")
+            
+            self.root.after(0, lambda: self.piano_roll.set_midi_data(midi_data))
+            
+            self.log("🎹 Синтез фортепиано...")
+            self.synthesize_piano(midi_data)
+            
+            self.log(f"✅ Синтез завершён")
+            self.log("=" * 50)
+            
+            self.root.after(0, self.processing_finished, True)
+            
+        except Exception as e:
+            self.log(f"❌ ОШИБКА: {str(e)}")
+            self.log(traceback.format_exc())
+            self.log("=" * 50)
+            self.root.after(0, self.processing_finished, False)
+    
+    def synthesize_piano(self, midi_data):
+        sample_rate = 44100
+        total_duration = midi_data.get_end_time() + 0.5
+        num_samples = int(sample_rate * total_duration)
+        audio = np.zeros(num_samples, dtype=np.float32)
+        
+        attack, decay, sustain, release = 0.005, 0.1, 0.7, 0.2
+        note_count = 0
+        
+        for instrument in midi_data.instruments:
+            if instrument.is_drum:
+                continue
+            for note in instrument.notes:
+                note_count += 1
+                freq = pretty_midi.note_number_to_hz(note.pitch)
+                start_idx = int(note.start * sample_rate)
+                duration = note.end - note.start
+                note_len = int(duration * sample_rate)
+                
+                if note_len < 10:
+                    continue
+                
+                envelope = np.ones(note_len)
+                attack_len = int(attack * sample_rate)
+                if attack_len > 0 and attack_len <= note_len:
+                    envelope[:attack_len] = np.linspace(0, 1, attack_len)
+                
+                decay_len = int(decay * sample_rate)
+                decay_start = attack_len
+                decay_end = min(decay_start + decay_len, note_len)
+                if decay_end > decay_start:
+                    envelope[decay_start:decay_end] = np.linspace(1, sustain, decay_end - decay_start)
+                
+                sustain_start = decay_end
+                if sustain_start < note_len:
+                    envelope[sustain_start:] = sustain
+                
+                release_len = int(release * sample_rate)
+                release_start = max(0, note_len - release_len)
+                if release_start < note_len:
+                    release_env = np.linspace(sustain, 0, note_len - release_start)
+                    envelope[release_start:] = release_env
+                
+                t = np.linspace(0, duration, note_len, endpoint=False)
+                signal = (0.7 * np.sin(2 * np.pi * freq * t) +
+                          0.2 * np.sin(2 * np.pi * freq * 2 * t) +
+                          0.1 * np.sin(2 * np.pi * freq * 3 * t))
+                
+                signal = signal * envelope * (note.velocity / 127.0)
+                end_idx = min(start_idx + note_len, num_samples)
+                audio[start_idx:end_idx] += signal[:end_idx - start_idx]
+        
+        max_val = np.max(np.abs(audio))
+        if max_val > 0.9:
+            audio = audio / max_val * 0.9
+        
+        fade_len = int(0.01 * sample_rate)
+        if fade_len < num_samples:
+            fade_env = np.linspace(1, 0, fade_len)
+            audio[-fade_len:] *= fade_env
+        
+        self.temp_result_path = os.path.join(self.temp_dir, "result.wav")
+        sf.write(self.temp_result_path, audio, sample_rate)
+        
+        self.result_audio_data = audio
+        self.result_sample_rate = sample_rate
+        
+        self.log(f"   Синтезировано: {note_count} нот")
+    
+    def save_result(self):
+        if self.result_audio_data is None:
+            messagebox.showinfo("Информация", "Сначала обработайте аудиофайл")
+            return
+        
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".wav",
+            filetypes=[("WAV файлы", "*.wav")],
+            initialfile="piano_result.wav"
+        )
+        
+        if file_path:
+            try:
+                sf.write(file_path, self.result_audio_data, self.result_sample_rate)
+                self.log(f"💾 Сохранено: {os.path.basename(file_path)}")
+                messagebox.showinfo("Успех", f"Файл сохранён!")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось сохранить:\n{e}")
+    
+    def export_midi(self):
+        if self.midi_data is None:
+            messagebox.showinfo("Информация", "Сначала обработайте аудиофайл")
+            return
+        
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".mid",
+            filetypes=[("MIDI файлы", "*.mid")],
+            initialfile="transcription.mid"
+        )
+        
+        if file_path:
+            try:
+                self.midi_data.write(file_path)
+                self.log(f"🎼 MIDI сохранён: {os.path.basename(file_path)}")
+                messagebox.showinfo("Успех", "MIDI файл сохранён!")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось сохранить:\n{e}")
+    
+    def processing_finished(self, success):
+        self.processing = False
+        self.progress.stop()
+        self.start_button.config(state="normal")
+        
+        if success:
+            self.status_var.set("Готово!")
+            self.save_button.config(state="normal")
+            self.export_midi_button.config(state="normal")
+            if hasattr(self, 'temp_result_path') and os.path.exists(self.temp_result_path):
+                self.player.load_file(self.temp_result_path)
+        else:
+            self.status_var.set("Ошибка обработки")
+
+
+def main():
+    root = tk.Tk()
+    app = SimplePianoTranscriber(root)
+    app.process_log_queue()
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
